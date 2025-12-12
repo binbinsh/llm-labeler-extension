@@ -1,0 +1,30 @@
+{
+  "name": "llm-labeler-extension",
+  "version": "0.10.0",
+  "description": "Chrome extension to batch labeling with Gemini / ChatGPT web",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dexie": "^4.2.1",
+    "pako": "^2.1.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.32",
+    "@types/node": "^25.0.0",
+    "@types/pako": "^2.0.4",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  }
+}

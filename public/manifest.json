@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Labeler",
+  "version": "0.10.0",
+  "description": "Batch labeler for Gemini/ChatGPT side-by-side with the page.",
+  "action": {
+    "default_title": "LLM Labeler"
+  },
+  "side_panel": {
+    "default_path": "options.html"
+  },
+  "icons": {
+    "16": "icons/icon.png",
+    "48": "icons/icon.png",
+    "128": "icons/icon.png"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "permissions": ["storage", "tabs", "scripting", "sidePanel"],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://chatgpt.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content/gemini.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content/chatgpt.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/*",
+        "assets/*.js",
+        "assets/*.css",
+        "assets/*.ttf",
+        "assets/*.worker.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
