@@ -274,6 +274,42 @@ function extractObjectList(raw: string) {
   return out.length ? out : null;
 }
 
+function extractRawObjectEntries(raw: string) {
+  const cleaned = unwrapJsonish(raw);
+  const out: string[] = [];
+  let idx = 0;
+  while (idx < cleaned.length) {
+    const slice = cleaned.slice(idx);
+    const balanced = sliceBalanced(slice, "{", "}");
+    if (!balanced) break;
+    idx += slice.indexOf(balanced) + balanced.length;
+    out.push(balanced.trim());
+  }
+  if (out.length) return out;
+  const lines = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length ? lines : null;
+}
+
+function parseLooseObject(rawObj: string, fallbackId: string) {
+  const trimmed = (rawObj || "").trim();
+  if (!trimmed) return null;
+  const idMatch = trimmed.match(/"id"\s*:\s*"([^"]*)"/i);
+  const id = (idMatch?.[1] || fallbackId || "").trim();
+  const textFieldMatch = trimmed.match(/"(output_text|output|text|completion)"\s*:/i);
+  if (!textFieldMatch || textFieldMatch.index == null) return null;
+  const start = textFieldMatch.index + textFieldMatch[0].length;
+  const end = trimmed.lastIndexOf("}");
+  const slice = end > start ? trimmed.slice(start, end) : trimmed.slice(start);
+  let value = slice.trim();
+  value = value.replace(/,\s*$/, "");
+  if (value.startsWith('"')) value = value.slice(1);
+  value = value.replace(/"\s*$/, "");
+  return { id, output_text: value, parseMode: "line_split_fallback" };
+}
+
 function normalizeParsed(entry: any, fallbackId: string) {
   const id = entry?.id ?? entry?.sampleId ?? entry?.sample_id ?? fallbackId;
   const output_text =
@@ -300,6 +336,16 @@ function coerceSingleObject(raw: string) {
 function parseSingleResponse(raw: string, item: QueueItem) {
   const obj = coerceSingleObject(raw);
   if (!obj) {
+    const fallbackEntries = extractRawObjectEntries(raw);
+    if (fallbackEntries && fallbackEntries.length) {
+      const fallback =
+        parseLooseObject(fallbackEntries[0], item.sample.id || item.id) || {
+          id: item.sample.id || item.id,
+          output_text: fallbackEntries[0],
+          parseMode: "line_split_fallback"
+        };
+      return { ok: true, parsed: normalizeParsed(fallback, item.sample.id || item.id) };
+    }
     return { ok: false, parsed: { error: "parse_failed", raw } };
   }
   const normalized = normalizeParsed(obj, item.sample.id || item.id);
@@ -333,6 +379,42 @@ function parseBatchResponse(raw: string, items: QueueItem[]) {
         parsed: normalizeParsed(entry, items[idx].sample.id || items[idx].id),
         raw: JSON.stringify(entry)
       }));
+    }
+    const fallbackEntries = extractRawObjectEntries(raw);
+    if (fallbackEntries && fallbackEntries.length) {
+      const fallbackObjects = fallbackEntries.map((entry, idx) => ({
+        raw: entry,
+        obj: parseLooseObject(entry, items[idx]?.sample.id || items[idx]?.id || "")
+      }));
+      const byId = new Map<string, (typeof fallbackObjects)[number]>();
+      fallbackObjects.forEach((entry) => {
+        if (entry.obj?.id) byId.set(String(entry.obj.id), entry);
+      });
+      return items.map((item, idx) => {
+        const fallbackId = item.sample.id || item.id;
+        const picked = byId.get(String(fallbackId)) ?? fallbackObjects[idx];
+        if (!picked) {
+          return {
+            item,
+            ok: false,
+            parsed: { error: "line_split_missing_entry", raw },
+            raw
+          };
+        }
+        const parsedEntry =
+          picked.obj ??
+          ({
+            id: fallbackId,
+            output_text: picked.raw,
+            parseMode: "line_split_fallback"
+          } as any);
+        return {
+          item,
+          ok: true,
+          parsed: normalizeParsed(parsedEntry, fallbackId),
+          raw: picked.raw
+        };
+      });
     }
     return items.map((item) => ({
       item,

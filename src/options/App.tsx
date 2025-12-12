@@ -316,9 +316,13 @@ export function App() {
             return;
           }
           const now = Date.now();
-          const id: string = generateId(now);
-          const normalizedSample: Sample = { id, text: rawLine };
-          const promptForSample = buildSamplePrompt(rawLine);
+          const extracted = extractSampleText(rawLine);
+          const id: string = extracted.sampleId?.trim() || generateId(now);
+          const normalizedSample: Sample = { id, text: extracted.text };
+          if (extracted.source !== "raw") {
+            normalizedSample.meta = { source: extracted.source };
+          }
+          const promptForSample = buildSamplePrompt(id, extracted.text);
           buffer.push({
             id,
             prompt: promptForSample,
@@ -562,8 +566,46 @@ function Stat({ label, value }: { label: string; value: number | string }) {
   );
 }
 
-function buildSamplePrompt(line: string) {
-  return line.trim();
+function buildSamplePrompt(id: string, line: string) {
+  const text = line.trim();
+  return JSON.stringify({ id, input_text: text || "" });
+}
+
+type SampleTextSource = "input_text" | "inputText" | "text" | "raw";
+
+function extractSampleText(
+  rawLine: string
+): { text: string; source: SampleTextSource; sampleId?: string } {
+  const trimmed = rawLine.trim();
+  if (!trimmed) return { text: "", source: "raw" };
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const idCandidate =
+        (parsed as Record<string, unknown>).id ??
+        (parsed as Record<string, unknown>).sampleId ??
+        (parsed as Record<string, unknown>).sample_id;
+      const parsedId =
+        typeof idCandidate === "string"
+          ? idCandidate.trim()
+          : typeof idCandidate === "number"
+            ? String(idCandidate)
+            : undefined;
+      const keys: SampleTextSource[] = ["input_text", "inputText", "text"];
+      for (const key of keys) {
+        const value = (parsed as Record<string, unknown>)[key];
+        if (typeof value === "string" && value.trim()) {
+          return { text: value.trim(), source: key, sampleId: parsedId };
+        }
+      }
+      if (parsedId) {
+        return { text: trimmed, source: "raw", sampleId: parsedId };
+      }
+    }
+  } catch {
+    /* ignore parse errors and fall back to raw */
+  }
+  return { text: trimmed, source: "raw" };
 }
 
 function generateId(now: number) {
