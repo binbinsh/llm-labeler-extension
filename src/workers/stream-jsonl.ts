@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { ungzip } from "pako";
+import { Inflate } from "pako";
 
 interface RequestMessage {
   file: File;
@@ -8,30 +8,69 @@ interface RequestMessage {
 
 self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
   const { file, isGzip } = ev.data;
-  const reader = file.stream().getReader();
   const decoder = new TextDecoder("utf-8");
-  const chunkSize = 1024 * 512;
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    let data: Uint8Array = value!;
-    if (isGzip) {
-      data = ungzip(data);
-    }
-    buffer += decoder.decode(data, { stream: true });
-    let lines = buffer.split("\n");
+  const processChunk = (chunk: Uint8Array) => {
+    buffer += decoder.decode(chunk, { stream: true });
+    const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
       (self as unknown as Worker).postMessage({ type: "line", line });
     }
-  }
+  };
 
-  if (buffer.trim()) {
-    (self as unknown as Worker).postMessage({ type: "line", line: buffer });
-  }
+  const flushRemainder = () => {
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      (self as unknown as Worker).postMessage({ type: "line", line: buffer });
+    }
+    buffer = "";
+  };
 
-  (self as unknown as Worker).postMessage({ type: "done" });
+  try {
+    if (isGzip && typeof DecompressionStream === "undefined") {
+      const reader = file.stream().getReader();
+      const inflater = new Inflate({ windowBits: 15 + 32 });
+      inflater.onData = (chunk: Uint8Array) => processChunk(chunk);
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        inflater.push(value, false);
+        if (inflater.err) {
+          throw new Error(inflater.msg || "Failed to decompress gzip stream");
+        }
+      }
+
+      inflater.push(new Uint8Array(0), true);
+      if (inflater.err) {
+        throw new Error(inflater.msg || "Failed to decompress gzip stream");
+      }
+    } else {
+      const stream = isGzip
+        ? file.stream().pipeThrough(new DecompressionStream("gzip"))
+        : file.stream();
+      const reader = stream.getReader();
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        processChunk(value);
+      }
+    }
+
+    flushRemainder();
+    (self as unknown as Worker).postMessage({ type: "done" });
+  } catch (err: any) {
+    (self as unknown as Worker).postMessage({
+      type: "error",
+      error: err?.message || err?.toString?.() || String(err)
+    });
+    flushRemainder();
+    (self as unknown as Worker).postMessage({ type: "done" });
+  }
 };
