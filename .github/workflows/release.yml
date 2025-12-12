@@ -1,0 +1,86 @@
+name: Release Chrome Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_run:
+    workflows: ["Auto Tag From Version"]
+    types: [completed]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+          fetch-depth: 0
+
+      - name: Determine tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            SHA="${GITHUB_SHA}"
+          else
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            git fetch --tags --force
+            TAG=$(git tag --points-at "$SHA" | grep '^v' | head -n1 || true)
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "No tag found for commit ${SHA:-unknown}; skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check existing release
+        id: release_check
+        if: steps.vars.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release for $TAG already exists; skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.vars.outputs.skip != 'true' && steps.release_check.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.vars.outputs.skip != 'true' && steps.release_check.outputs.exists != 'true'
+        run: npm ci
+
+      - name: Build extension
+        if: steps.vars.outputs.skip != 'true' && steps.release_check.outputs.exists != 'true'
+        run: npm run build
+
+      - name: Pack extension as zip
+        if: steps.vars.outputs.skip != 'true' && steps.release_check.outputs.exists != 'true'
+        run: |
+          cd dist
+          zip -r ../llm-labeler-extension.zip .
+
+      - name: Publish release
+        if: steps.vars.outputs.skip != 'true' && steps.release_check.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          files: llm-labeler-extension.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
