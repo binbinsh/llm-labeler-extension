@@ -31,7 +31,7 @@ then load `dist/` in Google Chrome as an unpacked extension.
 - Set your prompt, batch size, and delay
 - With a signed-in Gemini or ChatGPT tab open, click **Start processing**
 - Clear reset IndexedDB, Retry requeues errors, Export downloads JSONL
-- The first batch sends the prompt plus samples; later batches send only samples
+- Each batch sends the prompt plus a batch of samples
 
 ## Disclaimer
 This extension is for research and educational purposes only. Users are responsible for complying with the terms of service of Gemini, ChatGPT, and any other platforms used. The authors assume no liability for misuse or violations of third-party policies.

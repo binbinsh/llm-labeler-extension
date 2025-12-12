@@ -41,14 +41,12 @@ const state: {
   processing: boolean;
   settings: SettingsDoc;
   prompt: string;
-  primed: boolean;
 } = {
   running: false,
   timer: null,
   processing: false,
   settings: DEFAULT_SETTINGS,
-  prompt: DEFAULT_PROMPT,
-  primed: false
+  prompt: DEFAULT_PROMPT
 };
 
 function normalizePromptInput(prompt: string) {
@@ -156,8 +154,9 @@ async function sendPromptToTab(
   }
 }
 
-function buildBatchPrompt(items: QueueItem[], prompt: string, includePrompt: boolean) {
-  const prefix = includePrompt && prompt.trim() ? `${prompt.trim()}\n\n` : "";
+function buildBatchPrompt(items: QueueItem[], prompt: string) {
+  const trimmedPrompt = prompt.trim();
+  const prefix = trimmedPrompt ? `${trimmedPrompt}\n\n` : "";
   const body = items
     .map((item) => (item.prompt || "").trim())
     .filter(Boolean)
@@ -541,7 +540,7 @@ async function processOne(): Promise<boolean> {
     )
   );
 
-  const prompt = buildBatchPrompt(items, state.prompt, !state.primed);
+  const prompt = buildBatchPrompt(items, state.prompt);
   const res = await sendPromptToTab(tabId, prompt, items.map((i) => i.id).join(","));
   if (!res.ok || !res.reply) {
     console.warn("[llm-labeler][bg] send failed", res.error);
@@ -555,8 +554,6 @@ async function processOne(): Promise<boolean> {
     }
     return true;
   }
-
-  state.primed = true;
 
   if (items.length === 1) {
     const item = items[0];
@@ -590,7 +587,6 @@ async function processBatch() {
       }, state.settings.responseDelayMs);
     } else if (!ok) {
       state.running = false;
-      state.primed = false;
       lockedTarget = null;
       if (state.timer) clearTimeout(state.timer);
       state.timer = null;
@@ -615,14 +611,12 @@ async function handleStart(settings: SettingsDoc) {
   state.settings = { ...settings, id: "active", updatedAt: Date.now() };
   await db.settings.put(state.settings);
   state.prompt = await loadPromptFromDB();
-  state.primed = false;
   state.running = true;
   startLoop();
 }
 
 function handlePause() {
   state.running = false;
-  state.primed = false;
   if (state.timer) clearTimeout(state.timer);
   state.timer = null;
   lockedTarget = null;
@@ -656,7 +650,6 @@ chrome.runtime.onMessage.addListener(
             break;
           case "prompt:update":
             state.prompt = normalizePromptInput(msg.prompt);
-            state.primed = false;
             await db.prompts.put({
               id: "active",
               prompt: state.prompt,

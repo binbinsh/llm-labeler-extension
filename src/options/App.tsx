@@ -379,7 +379,7 @@ export function App() {
               {running ? "Running" : "Paused"}
             </div>
           </div>
-          <p>First batch sends your prompt + samples; later batches send only samples.</p>
+          <p>Each batch sends your prompt plus samples.</p>
         </div>
       </header>
 
@@ -472,7 +472,7 @@ export function App() {
           <h2>Prompt</h2>
         </div>
         <p className="muted">
-          First call sends this prompt plus the raw batch (newline-joined). Later calls send only the raw batch. Keep replies as a JSON array of <code>{'{'}"id","output_text"{'}'}</code> objects. Prompt auto-saves as you type.
+          Each call sends this prompt plus the raw batch (newline-joined). Keep replies as a JSON array of <code>{'{'}"id","output_text"{'}'}</code> objects. Prompt auto-saves as you type.
         </p>
         <textarea
           className="prompt-input"
