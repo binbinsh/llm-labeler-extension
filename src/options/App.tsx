@@ -6,7 +6,8 @@ import type {
   QueueItem,
   Sample,
   StatsSnapshot,
-  ResultRecord
+  ResultRecord,
+  OutputCountMode
 } from "../shared/types";
 import { DEFAULT_PROMPT } from "../shared/defaultPrompt";
 import "./styles.css";
@@ -51,7 +52,7 @@ export function App() {
   useEffect(() => {
     (async () => {
       const savedPrompt = await db.prompts.get("active");
-      if (savedPrompt?.prompt) {
+      if (savedPrompt && typeof savedPrompt.prompt === "string") {
         setPrompt(savedPrompt.prompt);
       }
       const savedSettings = await db.settings.get("active");
@@ -60,6 +61,7 @@ export function App() {
           id: "active",
           responseDelayMs: savedSettings.responseDelayMs ?? DEFAULT_SETTINGS.responseDelayMs,
           batchSize: savedSettings.batchSize ?? DEFAULT_SETTINGS.batchSize,
+          outputCountMode: savedSettings.outputCountMode ?? DEFAULT_SETTINGS.outputCountMode,
           updatedAt: Date.now()
         });
       }
@@ -145,10 +147,8 @@ export function App() {
   }
 
   async function persistPrompt(currentPrompt: string) {
-    const nextPrompt = currentPrompt.trim() || DEFAULT_PROMPT;
-    setPrompt(nextPrompt);
-    await db.prompts.put({ id: "active", prompt: nextPrompt, updatedAt: Date.now() });
-    await sendToBackground({ type: "prompt:update", prompt: nextPrompt });
+    await db.prompts.put({ id: "active", prompt: currentPrompt, updatedAt: Date.now() });
+    await sendToBackground({ type: "prompt:update", prompt: currentPrompt });
   }
 
   const adjustPromptHeight = () => {
@@ -209,7 +209,8 @@ export function App() {
       type: "control:start",
       settings: {
         responseDelayMs: settings.responseDelayMs,
-        batchSize: settings.batchSize
+        batchSize: settings.batchSize,
+        outputCountMode: settings.outputCountMode
       }
     });
     if (res.ok) {
@@ -433,6 +434,28 @@ export function App() {
             />
             <small>Number of samples per prompt</small>
           </label>
+          <label className="field">
+            <span>Output count rule</span>
+            <select
+              value={settings.outputCountMode}
+              onChange={(e) =>
+                setSettings((s) => ({
+                  ...s,
+                  outputCountMode: e.target.value as OutputCountMode
+                }))
+              }
+            >
+              <option value="match_input">Match input count (strict)</option>
+              <option value="allow_mismatch">Allow mismatch (no errors)</option>
+            </select>
+            <small>
+              Match input count: Expects one output item per input sample. If a reply contains fewer
+              results than inputs, the missing samples are marked as errors. Allow mismatch: If the
+              reply count differs from the input count (or cannot be mapped 1:1), the entire reply
+              is treated as a single batch-level result and saved once (with the batch sample IDs);
+              no errors are raised for count mismatch.
+            </small>
+          </label>
           <div className="field">
             <span>Import file</span>
             <div className="file-picker">
@@ -470,9 +493,17 @@ export function App() {
       <section className="card">
         <div className="card-header">
           <h2>Prompt</h2>
+          <div className="actions">
+            <button type="button" onClick={() => setPrompt(DEFAULT_PROMPT)}>
+              Reset to default
+            </button>
+          </div>
         </div>
         <p className="muted">
-          Each call sends this prompt plus the raw batch (newline-joined). Keep replies as a JSON array of <code>{'{'}"id","output_text"{'}'}</code> objects. Prompt auto-saves as you type.
+          Each call sends this prompt plus the raw batch (newline-joined). Keep replies as a JSON
+          array of <code>{'{'}"id","output_text"{'}'}</code> objects. Prompt auto-saves as you type
+          (clearing it stays empty and is allowed). Leave it empty to send only the samples. Use
+          <b>Reset to default</b> to restore the built-in template.
         </p>
         <textarea
           className="prompt-input"

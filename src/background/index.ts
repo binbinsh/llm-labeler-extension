@@ -21,7 +21,26 @@ const injectedTabs = new Set<number>();
 let lockedTarget: { tabId: number; target: TargetSite } | null = null;
 
 async function ensureContentScript(tabId: number, target: TargetSite) {
-  if (injectedTabs.has(tabId)) return;
+  const hasListener = await new Promise<boolean>((resolve) => {
+    try {
+      chrome.tabs.sendMessage(tabId, { type: "ping" }, (res) => {
+        if (chrome.runtime.lastError) {
+          resolve(false);
+          return;
+        }
+        resolve(Boolean((res as any)?.ok));
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+
+  if (hasListener) {
+    injectedTabs.add(tabId);
+    return;
+  }
+
+  injectedTabs.delete(tabId);
   const file = `content/${target}.js`;
   try {
     await chrome.scripting.executeScript({
@@ -49,9 +68,8 @@ const state: {
   prompt: DEFAULT_PROMPT
 };
 
-function normalizePromptInput(prompt: string) {
-  const next = (prompt || "").trim();
-  return next || DEFAULT_PROMPT;
+function normalizePromptInput(prompt: unknown) {
+  return typeof prompt === "string" ? prompt : DEFAULT_PROMPT;
 }
 
 const queryTabs = (query: chrome.tabs.QueryInfo) =>
@@ -316,6 +334,44 @@ function normalizeParsed(entry: any, fallbackId: string) {
   return { ...entry, id, output_text };
 }
 
+function extractOutputText(entry: any): string | null {
+  const value = entry?.output_text ?? entry?.output ?? entry?.text ?? entry?.completion;
+  return typeof value === "string" ? value : null;
+}
+
+type BatchParseEntry = { item: QueueItem; ok: boolean; parsed: any; raw: string };
+
+type BatchParseResult =
+  | { mode: "per_item"; entries: BatchParseEntry[] }
+  | { mode: "batch_level"; ok: true; parsed: any; raw: string };
+
+function buildBatchLevelParsed(raw: string, items: QueueItem[], candidate: unknown) {
+  const cleaned = unwrapJsonish(raw);
+  let output_text = cleaned;
+  const outputCount = Array.isArray(candidate)
+    ? candidate.length
+    : candidate && typeof candidate === "object"
+      ? 1
+      : undefined;
+
+  if (Array.isArray(candidate) && candidate.length === 1) {
+    const only = candidate[0];
+    if (only && typeof only === "object" && !Array.isArray(only)) {
+      output_text = extractOutputText(only) ?? cleaned;
+    }
+  } else if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+    output_text = extractOutputText(candidate) ?? cleaned;
+  }
+
+  return {
+    output_text,
+    parseMode: "batch_level_output",
+    inputCount: items.length,
+    outputCount,
+    sampleIds: items.map((item) => item.sample.id || item.id)
+  };
+}
+
 function coerceSingleObject(raw: string) {
   const obj = extractJSONObject(raw);
   if (obj) return obj;
@@ -352,101 +408,113 @@ function parseSingleResponse(raw: string, item: QueueItem) {
   return { ok, parsed: normalized };
 }
 
-function parseBatchResponse(raw: string, items: QueueItem[]) {
+function parseBatchResponse(raw: string, items: QueueItem[], allowCountMismatch: boolean): BatchParseResult {
+  const batchLevel = (candidate: unknown): BatchParseResult => ({
+    mode: "batch_level",
+    ok: true,
+    raw,
+    parsed: buildBatchLevelParsed(raw, items, candidate)
+  });
+
   const payload = extractJSONArray(raw);
-  if (!Array.isArray(payload) && items.length === 1) {
-    const single = coerceSingleObject(raw);
-    if (single) {
-      const normalized = normalizeParsed(single, items[0].sample.id || items[0].id);
-      return [
-        {
-          item: items[0],
-          ok: typeof single.ok === "undefined" ? true : Boolean(single.ok),
-          parsed: normalized,
-          raw
-        }
-      ];
+  if (Array.isArray(payload)) {
+    if (allowCountMismatch && payload.length !== items.length) {
+      return batchLevel(payload);
     }
-  }
-  if (!Array.isArray(payload)) {
-    const looseObjects = extractObjectList(raw);
-    if (looseObjects && looseObjects.length) {
-      const mapped = items.map((item, idx) => looseObjects[idx] || looseObjects[0]);
-      return mapped.map((entry, idx) => ({
-        item: items[idx],
-        ok: typeof entry.ok === "undefined" ? true : Boolean(entry.ok),
-        parsed: normalizeParsed(entry, items[idx].sample.id || items[idx].id),
-        raw: JSON.stringify(entry)
-      }));
-    }
-    const fallbackEntries = extractRawObjectEntries(raw);
-    if (fallbackEntries && fallbackEntries.length) {
-      const fallbackObjects = fallbackEntries.map((entry, idx) => ({
-        raw: entry,
-        obj: parseLooseObject(entry, items[idx]?.sample.id || items[idx]?.id || "")
-      }));
-      const byId = new Map<string, (typeof fallbackObjects)[number]>();
-      fallbackObjects.forEach((entry) => {
-        if (entry.obj?.id) byId.set(String(entry.obj.id), entry);
-      });
-      return items.map((item, idx) => {
-        const fallbackId = item.sample.id || item.id;
-        const picked = byId.get(String(fallbackId)) ?? fallbackObjects[idx];
-        if (!picked) {
-          return {
-            item,
-            ok: false,
-            parsed: { error: "line_split_missing_entry", raw },
-            raw
-          };
-        }
-        const parsedEntry =
-          picked.obj ??
-          ({
-            id: fallbackId,
-            output_text: picked.raw,
-            parseMode: "line_split_fallback"
-          } as any);
+    const byId = new Map<string, any>();
+    payload.forEach((entry) => {
+      const id = entry?.id ?? entry?.sampleId ?? entry?.sample_id;
+      if (id != null) byId.set(String(id), entry);
+    });
+    let missing = false;
+    const entries: BatchParseEntry[] = items.map((item, idx) => {
+      const fallbackId = item.sample.id || item.id;
+      const picked = byId.get(String(fallbackId)) ?? payload[idx];
+      const entryRaw = picked ? JSON.stringify(picked) : raw;
+      if (!picked) {
+        missing = true;
         return {
           item,
-          ok: true,
-          parsed: normalizeParsed(parsedEntry, fallbackId),
-          raw: picked.raw
+          ok: false,
+          parsed: { error: "missing_result_for_id", id: fallbackId, raw },
+          raw
         };
-      });
+      }
+      const normalized = normalizeParsed(picked, fallbackId);
+      return { item, ok: true, parsed: normalized, raw: entryRaw };
+    });
+    if (allowCountMismatch && missing) {
+      return batchLevel(payload);
     }
-    return items.map((item) => ({
-      item,
-      ok: false,
-      parsed: { error: "batch_parse_failed", raw },
-      raw
-    }));
+    return { mode: "per_item", entries };
   }
-  const byId = new Map<string, any>();
-  payload.forEach((entry) => {
-    const id = entry?.id ?? entry?.sampleId ?? entry?.sample_id;
-    if (id != null) byId.set(String(id), entry);
-  });
-  return items.map((item, idx) => {
-    const fallbackId = item.sample.id || item.id;
-    const picked = byId.get(String(fallbackId)) ?? payload[idx];
-    const entryRaw = picked ? JSON.stringify(picked) : raw;
-    if (!picked) {
+
+  const looseObjects = extractObjectList(raw);
+  if (looseObjects && looseObjects.length) {
+    if (allowCountMismatch && looseObjects.length !== items.length) {
+      return batchLevel(looseObjects);
+    }
+    const mapped = items.map((_item, idx) => looseObjects[idx] || looseObjects[0]);
+    const entries: BatchParseEntry[] = mapped.map((entry, idx) => ({
+      item: items[idx],
+      ok: typeof entry.ok === "undefined" ? true : Boolean(entry.ok),
+      parsed: normalizeParsed(entry, items[idx].sample.id || items[idx].id),
+      raw: JSON.stringify(entry)
+    }));
+    return { mode: "per_item", entries };
+  }
+
+  const fallbackEntries = extractRawObjectEntries(raw);
+  if (fallbackEntries && fallbackEntries.length) {
+    if (allowCountMismatch && fallbackEntries.length !== items.length) {
+      return batchLevel(fallbackEntries);
+    }
+    const fallbackObjects = fallbackEntries.map((entry, idx) => ({
+      raw: entry,
+      obj: parseLooseObject(entry, items[idx]?.sample.id || items[idx]?.id || "")
+    }));
+    const byId = new Map<string, (typeof fallbackObjects)[number]>();
+    fallbackObjects.forEach((entry) => {
+      if (entry.obj?.id) byId.set(String(entry.obj.id), entry);
+    });
+
+    let missing = false;
+    const entries: BatchParseEntry[] = items.map((item, idx) => {
+      const fallbackId = item.sample.id || item.id;
+      const picked = byId.get(String(fallbackId)) ?? fallbackObjects[idx];
+      if (!picked) {
+        missing = true;
+        return { item, ok: false, parsed: { error: "line_split_missing_entry", raw }, raw };
+      }
+      const parsedEntry =
+        picked.obj ??
+        ({
+          id: fallbackId,
+          output_text: picked.raw,
+          parseMode: "line_split_fallback"
+        } as any);
       return {
         item,
-        ok: false,
-        parsed: { error: "missing_result_for_id", id: fallbackId, raw },
-        raw
+        ok: true,
+        parsed: normalizeParsed(parsedEntry, fallbackId),
+        raw: picked.raw
       };
+    });
+
+    if (allowCountMismatch && missing) {
+      return batchLevel(fallbackEntries);
     }
-    const normalized = normalizeParsed(picked, fallbackId);
-    return {
-      item,
-      ok: true,
-      parsed: normalized,
-      raw: entryRaw
-    };
-  });
+
+    return { mode: "per_item", entries };
+  }
+
+  if (allowCountMismatch) {
+    return batchLevel(null);
+  }
+  return {
+    mode: "per_item",
+    entries: items.map((item) => ({ item, ok: false, parsed: { error: "batch_parse_failed", raw }, raw }))
+  };
 }
 
 async function markResult(
@@ -473,6 +541,40 @@ async function markResult(
     lastError: error,
     updatedAt: Date.now()
   });
+}
+
+async function markBatchResult(
+  items: QueueItem[],
+  rawResponse: string,
+  parsed: any,
+  actualTarget: TargetSite
+) {
+  const createdAt = Date.now();
+  let batchId = `batch-${createdAt}-${Math.random()}`;
+  try {
+    batchId = `batch-${crypto.randomUUID()}`;
+  } catch {
+    /* ignore */
+  }
+  await db.results.put({
+    id: batchId,
+    sampleId: batchId,
+    rawResponse,
+    parsed,
+    ok: true,
+    error: null,
+    target: actualTarget,
+    createdAt
+  });
+  await Promise.all(
+    items.map((item) =>
+      db.queue.update(item.id, {
+        status: "done",
+        lastError: null,
+        updatedAt: createdAt
+      })
+    )
+  );
 }
 
 async function loadPromptFromDB(): Promise<string> {
@@ -564,14 +666,25 @@ async function processOne(): Promise<boolean> {
     }
     console.debug("[llm-labeler][bg] done", item.id, "ok:", parsedResult.ok);
   } else {
-    const parsedList = parseBatchResponse(res.reply, items);
-    for (const entry of parsedList) {
-      await markResult(entry.item, entry.raw, entry.parsed, entry.ok, target);
-      if (!entry.ok) {
-        console.warn("[llm-labeler][bg] batch parse error", entry.parsed);
+    const allowCountMismatch = state.settings.outputCountMode === "allow_mismatch";
+    const parsed = parseBatchResponse(res.reply, items, allowCountMismatch);
+    if (parsed.mode === "batch_level") {
+      await markBatchResult(items, parsed.raw, parsed.parsed, target);
+      console.debug(
+        "[llm-labeler][bg] done batch as batch-level result",
+        items.length,
+        "target",
+        target
+      );
+    } else {
+      for (const entry of parsed.entries) {
+        await markResult(entry.item, entry.raw, entry.parsed, entry.ok, target);
+        if (!entry.ok) {
+          console.warn("[llm-labeler][bg] batch parse error", entry.parsed);
+        }
       }
+      console.debug("[llm-labeler][bg] done batch", items.length);
     }
-    console.debug("[llm-labeler][bg] done batch", items.length);
   }
   return true;
 }

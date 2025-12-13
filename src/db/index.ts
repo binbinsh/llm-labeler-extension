@@ -56,5 +56,6 @@ export const DEFAULT_SETTINGS: SettingsDoc = {
   id: "active",
   responseDelayMs: 2000,
   batchSize: 20,
+  outputCountMode: "match_input",
   updatedAt: Date.now()
 };

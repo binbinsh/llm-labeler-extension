@@ -45,8 +45,12 @@ export interface SettingsDoc {
   responseDelayMs: number;
   // How many samples to send per prompt
   batchSize: number;
+  // Whether to enforce output count == input batch size
+  outputCountMode: OutputCountMode;
   updatedAt: number;
 }
+
+export type OutputCountMode = "match_input" | "allow_mismatch";
 
 export interface StatsSnapshot {
   pending: number;

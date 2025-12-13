@@ -1,3 +1,17 @@
+(() => {
+  const STATE_KEY = "__LLM_LABELER_GEMINI_STATE__";
+  const g = globalThis as any;
+  const existing = g[STATE_KEY] as { listener?: any } | undefined;
+  if (existing?.listener) {
+    try {
+      chrome.runtime.onMessage.removeListener(existing.listener);
+    } catch {
+      /* ignore */
+    }
+  }
+  const state: { listener?: any } = {};
+  g[STATE_KEY] = state;
+
 const INPUT_SELECTORS = [
   // New Gemini rich editor
   '.ql-editor.textarea[contenteditable="true"]',
@@ -215,7 +229,7 @@ async function handlePrompt(prompt: string) {
   return reply;
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+const listener = (msg: any, _sender: any, sendResponse: (res: any) => void) => {
   (async () => {
     if (msg?.type === "ping") {
       sendResponse({ ok: true });
@@ -231,8 +245,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
   })();
   return true;
-});
+};
 
-export {};
+state.listener = listener;
+chrome.runtime.onMessage.addListener(listener);
 
 console.debug("[llm-labeler][gemini] content script loaded");
+
+})();
+
+export {};
