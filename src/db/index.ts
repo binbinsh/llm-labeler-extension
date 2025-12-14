@@ -72,6 +72,7 @@ export const DEFAULT_SETTINGS: SettingsDoc = {
   id: "active",
   responseDelayMs: 2000,
   batchSize: 20,
+  inputKeys: [],
   samplePercent: 100,
   outputCountMode: "match_input",
   updatedAt: Date.now()

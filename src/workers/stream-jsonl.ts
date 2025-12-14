@@ -4,7 +4,7 @@ import { Inflate } from "pako";
 interface RequestMessage {
   file: File;
   isGzip: boolean;
-  mode?: "stream" | "count";
+  mode?: "stream" | "count" | "analyze";
 }
 
 self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
@@ -12,6 +12,7 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   let lineCount = 0;
+  const keys = new Set<string>();
 
   const processChunk = (chunk: Uint8Array) => {
     buffer += decoder.decode(chunk, { stream: true });
@@ -19,10 +20,20 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
     buffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
-      if (mode === "count") {
+      if (mode === "count" || mode === "analyze") {
         lineCount += 1;
       } else {
         (self as unknown as Worker).postMessage({ type: "line", line });
+      }
+      if (mode === "analyze") {
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            Object.keys(parsed as Record<string, unknown>).forEach((k) => keys.add(k));
+          }
+        } catch {
+          // ignore parse errors
+        }
       }
     }
   };
@@ -30,10 +41,20 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
   const flushRemainder = () => {
     buffer += decoder.decode();
     if (buffer.trim()) {
-      if (mode === "count") {
+      if (mode === "count" || mode === "analyze") {
         lineCount += 1;
       } else {
         (self as unknown as Worker).postMessage({ type: "line", line: buffer });
+      }
+      if (mode === "analyze") {
+        try {
+          const parsed = JSON.parse(buffer);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            Object.keys(parsed as Record<string, unknown>).forEach((k) => keys.add(k));
+          }
+        } catch {
+          // ignore parse errors
+        }
       }
     }
     buffer = "";
@@ -74,9 +95,13 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
     }
 
     flushRemainder();
-    if (mode === "count") {
-      (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
-    }
+    if (mode === "count") (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
+    if (mode === "analyze")
+      (self as unknown as Worker).postMessage({
+        type: "analysis",
+        count: lineCount,
+        keys: Array.from(keys).sort()
+      });
     (self as unknown as Worker).postMessage({ type: "done" });
   } catch (err: any) {
     (self as unknown as Worker).postMessage({
@@ -84,9 +109,13 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
       error: err?.message || err?.toString?.() || String(err)
     });
     flushRemainder();
-    if (mode === "count") {
-      (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
-    }
+    if (mode === "count") (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
+    if (mode === "analyze")
+      (self as unknown as Worker).postMessage({
+        type: "analysis",
+        count: lineCount,
+        keys: Array.from(keys).sort()
+      });
     (self as unknown as Worker).postMessage({ type: "done" });
   }
 };

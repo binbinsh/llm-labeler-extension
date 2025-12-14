@@ -28,6 +28,7 @@ then load `dist/` in Google Chrome as an unpacked extension.
 
 ## Using the UI
 - Import `jsonl` / `jsonl.gz` (one JSON object per line)
+- After choosing a file, select which JSON key values to use as `input_text`
 - (Optional) Set **Sampling (%)** to randomly enqueue a subset on import (100% keeps original order)
 - Set your prompt, batch size, and delay
 - With a signed-in Gemini or ChatGPT tab open, click **Start processing**

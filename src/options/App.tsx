@@ -14,6 +14,55 @@ import "./styles.css";
 
 type ImportLog = { level: "info" | "error"; message: string };
 
+type ImportCandidate = {
+  file: File;
+  isGzip: boolean;
+  eligibleCount: number;
+  keys: string[];
+};
+
+const RECOMMENDED_INPUT_KEYS = [
+  "input_text",
+  "inputText",
+  "text",
+  "input",
+  "instruction",
+  "prompt",
+  "question",
+  "query",
+  "content"
+];
+
+function buildDefaultInputKeys(detectedKeys: string[], savedKeys: string[]) {
+  const detected = new Set(detectedKeys);
+  const next: string[] = [];
+  const pushUnique = (key: string) => {
+    if (!next.includes(key)) next.push(key);
+  };
+
+  if (detected.has("id")) pushUnique("id");
+  if (detected.has("input_text")) {
+    pushUnique("input_text");
+  } else {
+    const fallback = RECOMMENDED_INPUT_KEYS.find((k) => detected.has(k));
+    if (fallback) pushUnique(fallback);
+  }
+
+  for (const key of savedKeys) {
+    if (detected.has(key)) pushUnique(key);
+  }
+
+  if (next.length === 1 && next[0] === "id") {
+    const fallback =
+      RECOMMENDED_INPUT_KEYS.find((k) => k !== "id" && detected.has(k)) ??
+      detectedKeys.find((k) => k !== "id");
+    if (fallback) pushUnique(fallback);
+  }
+
+  if (!next.length) return detectedKeys.length ? [detectedKeys[0]] : [];
+  return next;
+}
+
 async function sendToBackground(msg: BackgroundMessage): Promise<BackgroundResponse> {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(msg, (res: BackgroundResponse) => {
@@ -38,7 +87,11 @@ export function App() {
   });
   const [running, setRunning] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [preparingImport, setPreparingImport] = useState(false);
   const [imported, setImported] = useState(0);
+  const [importCandidate, setImportCandidate] = useState<ImportCandidate | null>(null);
+  const [importKeySelection, setImportKeySelection] = useState<string[]>([]);
+  const [importKeyFilter, setImportKeyFilter] = useState("");
   const [logs, setLogs] = useState<ImportLog[]>([]);
   const [detectedTarget, setDetectedTarget] = useState<string>("Not detected");
   const [lastFileName, setLastFileName] = useState<string>("");
@@ -61,6 +114,9 @@ export function App() {
           id: "active",
           responseDelayMs: savedSettings.responseDelayMs ?? DEFAULT_SETTINGS.responseDelayMs,
           batchSize: savedSettings.batchSize ?? DEFAULT_SETTINGS.batchSize,
+          inputKeys: Array.isArray(savedSettings.inputKeys)
+            ? savedSettings.inputKeys.filter((k) => typeof k === "string")
+            : DEFAULT_SETTINGS.inputKeys,
           samplePercent: Math.min(
             100,
             Math.max(1, savedSettings.samplePercent ?? DEFAULT_SETTINGS.samplePercent)
@@ -214,6 +270,7 @@ export function App() {
       settings: {
         responseDelayMs: settings.responseDelayMs,
         batchSize: settings.batchSize,
+        inputKeys: settings.inputKeys,
         samplePercent: settings.samplePercent,
         outputCountMode: settings.outputCountMode
       }
@@ -269,11 +326,113 @@ export function App() {
     appendLog({ level: "info", message: "Cleared queue and results." });
   }
 
-  async function handleFile(file: File) {
+  const analyzeImportFile = (file: File, isGzip: boolean) =>
+    new Promise<{ eligibleCount: number; keys: string[] }>((resolve, reject) => {
+      const worker = new Worker(new URL("../workers/stream-jsonl.ts", import.meta.url), {
+        type: "module"
+      });
+      let eligibleCount = 0;
+      let keys: string[] = [];
+      let settled = false;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        worker.terminate();
+        fn();
+      };
+      worker.onmessage = (ev) => {
+        const data = ev.data;
+        if (data.type === "analysis") {
+          eligibleCount = Number(data.count) || 0;
+          keys = Array.isArray(data.keys)
+            ? (data.keys as unknown[]).filter((k: unknown): k is string => typeof k === "string")
+            : [];
+        } else if (data.type === "error") {
+          finish(() => reject(new Error(data.error || "analyze_failed")));
+        } else if (data.type === "done") {
+          finish(() => resolve({ eligibleCount, keys }));
+        }
+      };
+      worker.onerror = (err) => finish(() => reject(err));
+      worker.postMessage({ file, isGzip, mode: "analyze" });
+    });
+
+  async function prepareImport(file: File) {
+    if (importing || preparingImport) return;
+    setPreparingImport(true);
+    setImportCandidate(null);
+    setImportKeySelection([]);
+    setImportKeyFilter("");
+
+    appendLog({ level: "info", message: `Analyzing ${file.name} for JSON keys...` });
+    const isGzip = file.name.endsWith(".gz");
+    try {
+      const analysis = await analyzeImportFile(file, isGzip);
+      if (analysis.eligibleCount <= 0) {
+        appendLog({ level: "info", message: "No non-empty lines found. Nothing to import." });
+        return;
+      }
+      const candidate: ImportCandidate = {
+        file,
+        isGzip,
+        eligibleCount: analysis.eligibleCount,
+        keys: analysis.keys
+      };
+      if (!candidate.keys.length) {
+        appendLog({
+          level: "info",
+          message: "No JSON object keys detected; importing with raw line fallback."
+        });
+        setPreparingImport(false);
+        await handleFile(candidate, settings.inputKeys);
+        return;
+      }
+      setImportCandidate(candidate);
+      setImportKeySelection(buildDefaultInputKeys(candidate.keys, settings.inputKeys));
+      appendLog({
+        level: "info",
+        message: `Detected ${candidate.keys.length} key(s) from ${candidate.eligibleCount} line(s). Select which values to include.`
+      });
+    } catch (err: any) {
+      appendLog({ level: "error", message: `Analyze failed: ${err?.message || err}` });
+    } finally {
+      setPreparingImport(false);
+    }
+  }
+
+  async function startPreparedImport() {
+    if (!importCandidate) return;
+    const selectedKeys = importKeySelection.filter((k) => importCandidate.keys.includes(k));
+    if (!selectedKeys.length) {
+      appendLog({ level: "error", message: "Select at least one key to import." });
+      return;
+    }
+    const now = Date.now();
+    const nextSettings = { ...settings, inputKeys: selectedKeys, updatedAt: now };
+    setSettings(nextSettings);
+    try {
+      await db.settings.put({ ...nextSettings, id: "active" });
+    } catch (err: any) {
+      appendLog({ level: "error", message: `Failed to persist settings: ${err?.message || err}` });
+    }
+    const candidate = importCandidate;
+    setImportCandidate(null);
+    setImportKeySelection([]);
+    setImportKeyFilter("");
+    await handleFile(candidate, selectedKeys);
+  }
+
+  function cancelPreparedImport() {
+    setImportCandidate(null);
+    setImportKeySelection([]);
+    setImportKeyFilter("");
+  }
+
+  async function handleFile(candidate: ImportCandidate, inputKeys: string[]) {
     setImporting(true);
     setImported(0);
-    appendLog({ level: "info", message: `Importing ${file.name}...` });
-    const isGzip = file.name.endsWith(".gz");
+    appendLog({ level: "info", message: `Importing ${candidate.file.name}...` });
+    const { file, isGzip } = candidate;
     const samplePercent = Math.min(
       100,
       Math.max(1, Number(settings.samplePercent) || DEFAULT_SETTINGS.samplePercent)
@@ -288,50 +447,9 @@ export function App() {
       baseSeq = 0;
     }
 
-    const countNonEmptyLines = () =>
-      new Promise<number>((resolve, reject) => {
-        const counter = new Worker(new URL("../workers/stream-jsonl.ts", import.meta.url), {
-          type: "module"
-        });
-        let count = 0;
-        let settled = false;
-        const finish = (fn: () => void) => {
-          if (settled) return;
-          settled = true;
-          counter.terminate();
-          fn();
-        };
-        counter.onmessage = (ev) => {
-          const data = ev.data;
-          if (data.type === "count") {
-            count = Number(data.count) || 0;
-          } else if (data.type === "error") {
-            finish(() => reject(new Error(data.error || "count_failed")));
-          } else if (data.type === "done") {
-            finish(() => resolve(count));
-          }
-        };
-        counter.onerror = (err) => finish(() => reject(err));
-        counter.postMessage({ file, isGzip, mode: "count" });
-      });
-
-    let totalEligible = 0;
+    const totalEligible = candidate.eligibleCount;
     let targetEligible = 0;
     if (shouldSample) {
-      appendLog({
-        level: "info",
-        message: `Sampling ${samplePercent}%: counting non-empty lines...`
-      });
-      try {
-        totalEligible = await countNonEmptyLines();
-      } catch (err: any) {
-        setImporting(false);
-        appendLog({
-          level: "error",
-          message: `Failed to count lines: ${err?.message || err}`
-        });
-        return;
-      }
       if (totalEligible <= 0) {
         setImporting(false);
         appendLog({ level: "info", message: "No non-empty lines found. Nothing queued." });
@@ -411,13 +529,14 @@ export function App() {
             sampledIn += 1;
           }
           const now = Date.now();
-          const extracted = extractSampleText(rawLine);
+          const extracted = extractSampleText(rawLine, inputKeys);
           const id: string = extracted.sampleId?.trim() || generateId(now);
           const normalizedSample: Sample = { id, text: extracted.text };
           if (extracted.source !== "raw") {
             normalizedSample.meta = { source: extracted.source };
           }
-          const promptForSample = buildSamplePrompt(id, extracted.text);
+          const promptPayload: Record<string, unknown> = { id, ...extracted.payload };
+          const promptForSample = JSON.stringify(promptPayload);
           buffer.push({
             id,
             seq: baseSeq + (seen - 1),
@@ -461,7 +580,7 @@ export function App() {
     const file = e.target.files?.[0];
     if (file) {
       setLastFileName(file.name);
-      handleFile(file);
+      prepareImport(file);
       e.target.value = "";
     }
   };
@@ -573,37 +692,113 @@ export function App() {
               no errors are raised for count mismatch.
             </small>
           </label>
-          <div className="field">
-            <span>Import file</span>
-            <div className="file-picker">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={importing}
-              >
-                Choose file
-              </button>
-              <span className="file-name">
-                {lastFileName || "No file selected"}
-              </span>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".jsonl,.gz,.jsonl.gz"
-                onChange={handleFileInput}
-                disabled={importing}
-                style={{ display: "none" }}
-              />
-            </div>
-            <small>Supports jsonl / jsonl.gz (streamed + gunzip)</small>
-            {importing && <div className="pill">Importing... queued {imported}</div>}
-          </div>
         </div>
         <div className="stats">
           <Stat label="Pending" value={stats.pending} />
           <Stat label="In-flight" value={stats.inflight} />
           <Stat label="Done" value={stats.done} />
           <Stat label="Error" value={stats.error} />
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="card-header">
+          <h2>Import</h2>
+        </div>
+        <div className="field">
+          <span>Import file</span>
+          <div className="file-picker">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={importing || preparingImport || Boolean(importCandidate)}
+            >
+              Choose file
+            </button>
+            <span className="file-name">{lastFileName || "No file selected"}</span>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".jsonl,.gz,.jsonl.gz"
+              onChange={handleFileInput}
+              disabled={importing || preparingImport || Boolean(importCandidate)}
+              style={{ display: "none" }}
+            />
+          </div>
+          <small>Supports jsonl / jsonl.gz (streamed + gunzip)</small>
+          {importing && <div className="pill">Importing... queued {imported}</div>}
+          {preparingImport && <div className="pill">Analyzing...</div>}
+          {importCandidate && (
+            <div className="key-panel">
+              <div className="key-panel-head">
+                <div className="key-panel-title">Choose keys to include</div>
+                <div className="muted">
+                  Selected {importKeySelection.length} / {importCandidate.keys.length} (from{" "}
+                  {importCandidate.eligibleCount} line(s))
+                </div>
+              </div>
+              <input
+                className="key-filter"
+                type="text"
+                placeholder="Filter keys..."
+                value={importKeyFilter}
+                onChange={(e) => setImportKeyFilter(e.target.value)}
+              />
+              <div className="key-list">
+                {importCandidate.keys
+                  .filter((k) =>
+                    k.toLowerCase().includes(importKeyFilter.trim().toLowerCase())
+                  )
+                  .map((key) => {
+                    const checked = importKeySelection.includes(key);
+                    return (
+                      <label key={key} className="key-option">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            const nextChecked = e.target.checked;
+                            setImportKeySelection((prev) => {
+                              if (nextChecked) return prev.includes(key) ? prev : [...prev, key];
+                              return prev.filter((k) => k !== key);
+                            });
+                          }}
+                        />
+                        <span className="key-name">{key}</span>
+                      </label>
+                    );
+                  })}
+              </div>
+              <div className="key-actions">
+                <button type="button" onClick={() => setImportKeySelection(importCandidate.keys)}>
+                  Select all
+                </button>
+                <button type="button" onClick={() => setImportKeySelection([])}>
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setImportKeySelection(
+                      buildDefaultInputKeys(importCandidate.keys, settings.inputKeys)
+                    )
+                  }
+                >
+                  Reset
+                </button>
+                <button type="button" onClick={cancelPreparedImport}>
+                  Cancel
+                </button>
+                <button type="button" onClick={startPreparedImport}>
+                  Start import
+                </button>
+              </div>
+              <small>
+                Each sample will be sent as JSON containing <code>id</code> plus the selected keys
+                (values are preserved; missing keys are omitted).
+              </small>
+            </div>
+          )}
         </div>
       </section>
 
@@ -634,7 +829,10 @@ export function App() {
           onInput={adjustPromptHeight}
         />
         <div className="muted">
-          Each sample stays as its raw jsonl line (e.g. <code>{'{'}"id": "...", "input_text": "..."{'}'}</code>), joined with <code>\n</code>.
+          Each sample is sent as JSON (e.g. <code>{'{'}"id": "...", "input_text": "..."{'}'}</code>),
+          joined with <code>\n</code>. On import, you can choose which JSON keys to include (e.g.{" "}
+          <code>output_text</code> stays as <code>output_text</code> instead of being merged into{" "}
+          <code>input_text</code>).
         </div>
       </section>
 
@@ -719,13 +917,19 @@ function buildSamplePrompt(id: string, line: string) {
   return JSON.stringify({ id, input_text: text || "" });
 }
 
-type SampleTextSource = "input_text" | "inputText" | "text" | "raw";
+type SampleTextSource = "input_text" | "inputText" | "text" | "keys" | "raw";
 
 function extractSampleText(
-  rawLine: string
-): { text: string; source: SampleTextSource; sampleId?: string } {
+  rawLine: string,
+  inputKeys?: string[]
+): {
+  text: string;
+  source: SampleTextSource;
+  sampleId?: string;
+  payload: Record<string, unknown>;
+} {
   const trimmed = rawLine.trim();
-  if (!trimmed) return { text: "", source: "raw" };
+  if (!trimmed) return { text: "", source: "raw", payload: { input_text: "" } };
   try {
     const parsed = JSON.parse(trimmed);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -739,21 +943,56 @@ function extractSampleText(
           : typeof idCandidate === "number"
             ? String(idCandidate)
             : undefined;
-      const keys: SampleTextSource[] = ["input_text", "inputText", "text"];
-      for (const key of keys) {
-        const value = (parsed as Record<string, unknown>)[key];
-        if (typeof value === "string" && value.trim()) {
-          return { text: value.trim(), source: key, sampleId: parsedId };
+      const obj = parsed as Record<string, unknown>;
+      const selected = Array.isArray(inputKeys)
+        ? inputKeys.filter((k) => typeof k === "string" && k.trim() && k !== "id")
+        : [];
+
+      const payload: Record<string, unknown> = {};
+      for (const key of selected) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+          payload[key] = obj[key];
         }
       }
-      if (parsedId) {
-        return { text: trimmed, source: "raw", sampleId: parsedId };
+
+      let previewText: string | null = null;
+      const previewCandidates: Array<"input_text" | "inputText" | "text"> = [
+        "input_text",
+        "inputText",
+        "text"
+      ];
+      for (const k of previewCandidates) {
+        if (typeof payload[k] === "string" && (payload[k] as string).trim()) {
+          previewText = (payload[k] as string).trim();
+          break;
+        }
+        if (typeof obj[k] === "string" && (obj[k] as string).trim()) {
+          previewText = (obj[k] as string).trim();
+          break;
+        }
       }
+      if (previewText == null) previewText = trimmed;
+
+      if (Object.keys(payload).length) {
+        return { text: previewText, source: "keys", sampleId: parsedId, payload };
+      }
+
+      // If selected keys are missing on this line, fall back to a best-effort text field or the raw line.
+      for (const k of previewCandidates) {
+        if (Object.prototype.hasOwnProperty.call(obj, k)) {
+          payload[k] = obj[k];
+          if (typeof obj[k] === "string" && (obj[k] as string).trim()) {
+            previewText = (obj[k] as string).trim();
+          }
+          return { text: previewText, source: k, sampleId: parsedId, payload };
+        }
+      }
+      return { text: previewText, source: "raw", sampleId: parsedId, payload: { input_text: trimmed } };
     }
   } catch {
     /* ignore parse errors and fall back to raw */
   }
-  return { text: trimmed, source: "raw" };
+  return { text: trimmed, source: "raw", payload: { input_text: trimmed } };
 }
 
 function generateId(now: number) {

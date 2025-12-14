@@ -47,7 +47,9 @@ export interface SettingsDoc {
   responseDelayMs: number;
   // How many samples to send per prompt
   batchSize: number;
-  // Percentage of imported samples to enqueue (0-100).
+  // Which top-level JSON keys to extract into input_text on import.
+  inputKeys: string[];
+  // Percentage of imported samples to enqueue (1-100).
   // 100 preserves original file order; lower values randomly sample that share of lines.
   samplePercent: number;
   // Whether to enforce output count == input batch size
