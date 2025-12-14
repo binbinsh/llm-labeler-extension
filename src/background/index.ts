@@ -1,3 +1,4 @@
+import Dexie from "dexie";
 import { db, DEFAULT_SETTINGS } from "../db";
 import type {
   AutoTarget,
@@ -607,7 +608,11 @@ async function reconcileInflightItems() {
 
 async function processOne(): Promise<boolean> {
   const batchSize = Math.max(1, state.settings.batchSize || 1);
-  const items = await db.queue.where("status").equals("pending").limit(batchSize).toArray();
+  const items = await db.queue
+    .where("[status+seq]")
+    .between(["pending", Dexie.minKey], ["pending", Dexie.maxKey])
+    .limit(batchSize)
+    .toArray();
   if (!items.length) return false;
 
   const detected = await ensureTargetTab();

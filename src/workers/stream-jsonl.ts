@@ -4,12 +4,14 @@ import { Inflate } from "pako";
 interface RequestMessage {
   file: File;
   isGzip: boolean;
+  mode?: "stream" | "count";
 }
 
 self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
-  const { file, isGzip } = ev.data;
+  const { file, isGzip, mode = "stream" } = ev.data;
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let lineCount = 0;
 
   const processChunk = (chunk: Uint8Array) => {
     buffer += decoder.decode(chunk, { stream: true });
@@ -17,14 +19,22 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
     buffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
-      (self as unknown as Worker).postMessage({ type: "line", line });
+      if (mode === "count") {
+        lineCount += 1;
+      } else {
+        (self as unknown as Worker).postMessage({ type: "line", line });
+      }
     }
   };
 
   const flushRemainder = () => {
     buffer += decoder.decode();
     if (buffer.trim()) {
-      (self as unknown as Worker).postMessage({ type: "line", line: buffer });
+      if (mode === "count") {
+        lineCount += 1;
+      } else {
+        (self as unknown as Worker).postMessage({ type: "line", line: buffer });
+      }
     }
     buffer = "";
   };
@@ -64,6 +74,9 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
     }
 
     flushRemainder();
+    if (mode === "count") {
+      (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
+    }
     (self as unknown as Worker).postMessage({ type: "done" });
   } catch (err: any) {
     (self as unknown as Worker).postMessage({
@@ -71,6 +84,9 @@ self.onmessage = async (ev: MessageEvent<RequestMessage>) => {
       error: err?.message || err?.toString?.() || String(err)
     });
     flushRemainder();
+    if (mode === "count") {
+      (self as unknown as Worker).postMessage({ type: "count", count: lineCount });
+    }
     (self as unknown as Worker).postMessage({ type: "done" });
   }
 };

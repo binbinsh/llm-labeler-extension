@@ -61,6 +61,10 @@ export function App() {
           id: "active",
           responseDelayMs: savedSettings.responseDelayMs ?? DEFAULT_SETTINGS.responseDelayMs,
           batchSize: savedSettings.batchSize ?? DEFAULT_SETTINGS.batchSize,
+          samplePercent: Math.min(
+            100,
+            Math.max(1, savedSettings.samplePercent ?? DEFAULT_SETTINGS.samplePercent)
+          ),
           outputCountMode: savedSettings.outputCountMode ?? DEFAULT_SETTINGS.outputCountMode,
           updatedAt: Date.now()
         });
@@ -210,6 +214,7 @@ export function App() {
       settings: {
         responseDelayMs: settings.responseDelayMs,
         batchSize: settings.batchSize,
+        samplePercent: settings.samplePercent,
         outputCountMode: settings.outputCountMode
       }
     });
@@ -269,16 +274,88 @@ export function App() {
     setImported(0);
     appendLog({ level: "info", message: `Importing ${file.name}...` });
     const isGzip = file.name.endsWith(".gz");
-    const worker = new Worker(
-      new URL("../workers/stream-jsonl.ts", import.meta.url),
-      { type: "module" }
+    const samplePercent = Math.min(
+      100,
+      Math.max(1, Number(settings.samplePercent) || DEFAULT_SETTINGS.samplePercent)
     );
+    const shouldSample = samplePercent < 100;
+
+    let baseSeq = 0;
+    try {
+      const last = await db.queue.orderBy("seq").last();
+      baseSeq = typeof last?.seq === "number" ? last.seq + 1 : 0;
+    } catch {
+      baseSeq = 0;
+    }
+
+    const countNonEmptyLines = () =>
+      new Promise<number>((resolve, reject) => {
+        const counter = new Worker(new URL("../workers/stream-jsonl.ts", import.meta.url), {
+          type: "module"
+        });
+        let count = 0;
+        let settled = false;
+        const finish = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          counter.terminate();
+          fn();
+        };
+        counter.onmessage = (ev) => {
+          const data = ev.data;
+          if (data.type === "count") {
+            count = Number(data.count) || 0;
+          } else if (data.type === "error") {
+            finish(() => reject(new Error(data.error || "count_failed")));
+          } else if (data.type === "done") {
+            finish(() => resolve(count));
+          }
+        };
+        counter.onerror = (err) => finish(() => reject(err));
+        counter.postMessage({ file, isGzip, mode: "count" });
+      });
+
+    let totalEligible = 0;
+    let targetEligible = 0;
+    if (shouldSample) {
+      appendLog({
+        level: "info",
+        message: `Sampling ${samplePercent}%: counting non-empty lines...`
+      });
+      try {
+        totalEligible = await countNonEmptyLines();
+      } catch (err: any) {
+        setImporting(false);
+        appendLog({
+          level: "error",
+          message: `Failed to count lines: ${err?.message || err}`
+        });
+        return;
+      }
+      if (totalEligible <= 0) {
+        setImporting(false);
+        appendLog({ level: "info", message: "No non-empty lines found. Nothing queued." });
+        return;
+      }
+      targetEligible = Math.round((totalEligible * samplePercent) / 100);
+      targetEligible = Math.min(totalEligible, Math.max(1, targetEligible));
+      appendLog({
+        level: "info",
+        message: `Sampling ${samplePercent}%: will enqueue ${targetEligible}/${totalEligible} line(s).`
+      });
+    }
+
+    const worker = new Worker(new URL("../workers/stream-jsonl.ts", import.meta.url), {
+      type: "module"
+    });
     let buffer: QueueItem[] = [];
     let totalQueued = 0;
     let seen = 0;
     let skipped = 0;
     let failed = 0;
     let created = 0;
+    let sampledOut = 0;
+    let sampledIn = 0;
     let flushing = false;
     const flush = async () => {
       if (flushing) return;
@@ -309,12 +386,29 @@ export function App() {
     worker.onmessage = async (ev) => {
       const data = ev.data;
       if (data.type === "line") {
-        seen += 1;
         try {
           const rawLine: string = data.line;
           if (!rawLine.trim()) {
             skipped += 1;
             return;
+          }
+          seen += 1;
+          if (shouldSample) {
+            const need = targetEligible - sampledIn;
+            const remainingIncludingCurrent = totalEligible - seen + 1;
+            let take = false;
+            if (need <= 0) {
+              take = false;
+            } else if (need >= remainingIncludingCurrent) {
+              take = true;
+            } else {
+              take = Math.random() < need / remainingIncludingCurrent;
+            }
+            if (!take) {
+              sampledOut += 1;
+              return;
+            }
+            sampledIn += 1;
           }
           const now = Date.now();
           const extracted = extractSampleText(rawLine);
@@ -326,6 +420,7 @@ export function App() {
           const promptForSample = buildSamplePrompt(id, extracted.text);
           buffer.push({
             id,
+            seq: baseSeq + (seen - 1),
             prompt: promptForSample,
             sample: normalizedSample,
             status: "pending",
@@ -351,13 +446,15 @@ export function App() {
         setImporting(false);
         appendLog({
           level: "info",
-          message: `File processing completed. Seen ${seen}, created ${created}, queued ${totalQueued}, skipped ${skipped}, failed ${failed}.`
+          message: shouldSample
+            ? `File processing completed. Seen ${seen}, sampled ${sampledIn}/${totalEligible}, created ${created}, queued ${totalQueued}, sampled-out ${sampledOut}, skipped ${skipped}, failed ${failed}.`
+            : `File processing completed. Seen ${seen}, created ${created}, queued ${totalQueued}, skipped ${skipped}, failed ${failed}.`
         });
         worker.terminate();
       }
     };
 
-    worker.postMessage({ file, isGzip });
+    worker.postMessage({ file, isGzip, mode: "stream" });
   }
 
   const handleFileInput = (e: ChangeEvent<HTMLInputElement>) => {
@@ -433,6 +530,26 @@ export function App() {
               }
             />
             <small>Number of samples per prompt</small>
+          </label>
+          <label className="field">
+            <span>Sampling (%)</span>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={settings.samplePercent}
+              onChange={(e) =>
+                setSettings((s) => ({
+                  ...s,
+                  samplePercent:
+                    e.target.value === ""
+                      ? DEFAULT_SETTINGS.samplePercent
+                      : Math.min(100, Math.max(1, Number(e.target.value) || 1))
+                }))
+              }
+            />
+            <small>Applies on import. 100 keeps all lines; lower values randomly sample.</small>
           </label>
           <label className="field">
             <span>Output count rule</span>

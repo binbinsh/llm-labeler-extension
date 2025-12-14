@@ -47,6 +47,22 @@ export class LabelerDB extends Dexie {
           // Best-effort migration; ignore if legacy table is absent.
         }
       });
+
+    this.version(3)
+      .stores({
+        queue: "id,status,target,createdAt,updatedAt,seq,[status+seq]",
+        results: "id,sampleId,target,createdAt",
+        scripts: "id",
+        settings: "id",
+        prompts: "id"
+      })
+      .upgrade(async (tx) => {
+        const queue = tx.table("queue");
+        let seq = 0;
+        await queue.orderBy("createdAt").modify((item: any) => {
+          item.seq = seq++;
+        });
+      });
   }
 }
 
@@ -56,6 +72,7 @@ export const DEFAULT_SETTINGS: SettingsDoc = {
   id: "active",
   responseDelayMs: 2000,
   batchSize: 20,
+  samplePercent: 100,
   outputCountMode: "match_input",
   updatedAt: Date.now()
 };

@@ -12,6 +12,8 @@ export interface Sample {
 
 export interface QueueItem {
   id: string;
+  // Stable import order (used for deterministic dispatch ordering).
+  seq: number;
   prompt: string;
   sample: Sample;
   status: QueueStatus;
@@ -45,6 +47,9 @@ export interface SettingsDoc {
   responseDelayMs: number;
   // How many samples to send per prompt
   batchSize: number;
+  // Percentage of imported samples to enqueue (0-100).
+  // 100 preserves original file order; lower values randomly sample that share of lines.
+  samplePercent: number;
   // Whether to enforce output count == input batch size
   outputCountMode: OutputCountMode;
   updatedAt: number;
